@@ -1,0 +1,156 @@
+# Builds PalPop for every platform.
+# Pull requests: download the builds from the run's "Artifacts" list.
+# Pushes to main also:
+#   - replace the "latest" release, so the downloads live at
+#     https://github.com/williamschertzer/palpop/releases/latest
+#   - publish the web build to GitHub Pages
+#     (Settings → Pages → Source must be "GitHub Actions")
+name: Build game
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: "4.3"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Godot and export templates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/godot-bin
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_VERSION }}-stable-v1
+
+      - name: Install Godot and export templates
+        run: |
+          if [ ! -x ~/godot-bin/godot ]; then
+            mkdir -p ~/godot-bin
+            curl -sSL -o /tmp/godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+            unzip -q /tmp/godot.zip -d ~/godot-bin
+            mv ~/godot-bin/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot-bin/godot
+          fi
+          T=~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          if [ ! -f "$T/version.txt" ]; then
+            mkdir -p "$T"
+            curl -sSL -o /tmp/templates.tpz "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+            unzip -q -j /tmp/templates.tpz 'templates/version.txt' 'templates/web_nothreads_*' 'templates/linux_*.x86_64' 'templates/windows_*_x86_64*' 'templates/macos.zip' 'templates/android_*.apk' -d "$T"
+            rm /tmp/templates.tpz
+          fi
+          echo "$HOME/godot-bin" >> "$GITHUB_PATH"
+
+      - name: Import project and point Godot at the Android SDK
+        run: |
+          godot --headless --import
+          S=~/.config/godot/editor_settings-${GODOT_VERSION}.tres
+          sed -i "s|^export/android/android_sdk_path = .*|export/android/android_sdk_path = \"${ANDROID_SDK_ROOT}\"|" "$S"
+          sed -i "s|^export/android/java_sdk_path = .*|export/android/java_sdk_path = \"${JAVA_HOME}\"|" "$S"
+          grep "^export/android/" "$S"
+
+      - name: Check scripts and game rules
+        run: |
+          set -o pipefail
+          godot --headless -s tests/check_upgrades.gd 2>&1 | tee check.log
+          grep -q "check_upgrades: OK" check.log
+          godot --headless --quit-after 300 2>&1 | tee smoke.log
+          if grep -E "SCRIPT ERROR|Parse Error|Failed to load script" check.log smoke.log; then exit 1; fi
+
+      - name: Export
+        run: |
+          mkdir -p build/web build/windows build/macos build/linux build/android
+          godot --headless --export-release "Web" build/web/index.html
+          godot --headless --export-release "Windows" build/windows/PalPop.exe
+          godot --headless --export-release "macOS" build/macos/PalPop.zip
+          godot --headless --export-release "Linux" build/linux/PalPop.x86_64
+          godot --headless --export-debug "Android" build/android/PalPop.apk
+          ls -la build/*
+          test -f build/web/index.wasm
+          test -f build/windows/PalPop.exe
+          test -f build/macos/PalPop.zip
+          test -f build/linux/PalPop.x86_64
+          test -f build/android/PalPop.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PalPop-Web
+          path: build/web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PalPop-Windows
+          path: build/windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PalPop-macOS
+          path: build/macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PalPop-Linux
+          path: build/linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PalPop-Android
+          path: build/android
+
+      - name: Replace the "latest" release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release
+          (cd build/windows && zip -q -r ../../release/PalPop-Windows.zip .)
+          cp build/macos/PalPop.zip release/PalPop-macOS.zip
+          (cd build/linux && zip -q -r ../../release/PalPop-Linux.zip .)
+          cp build/android/PalPop.apk release/PalPop-Android.apk
+          (cd build/web && zip -q -r ../../release/PalPop-Web.zip .)
+          ls -la release
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest release/* \
+            --target "$GITHUB_SHA" \
+            --title "PalPop Defense (latest build)" \
+            --notes "Built automatically from main at ${GITHUB_SHA::7}. Windows: unzip and run PalPop.exe. Mac: unzip and open PalPop.app (see the README for the first-launch steps). Android: install the APK. Linux: unzip and run PalPop.x86_64."
+
+      - name: Assemble the GitHub Pages site
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p site
+          cp -r build/web/. site/
+          touch site/.nojekyll
+          ls -la site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          path: site
+
+  pages:
+    needs: export
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
